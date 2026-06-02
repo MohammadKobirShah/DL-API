@@ -23,10 +23,9 @@ jobs:
       - name: 🐳 Start bgutil PO Token provider
         id: bgutil
         run: |
-          # Note: no Docker-level --health-* flags; the bgutil image is based
-          # on node:*-slim and does not include wget/curl, so the in-container
-          # healthcheck command would always fail. The wait loop in the next
-          # step polls /ping from the runner via curl instead.
+          # The bgutil image is based on node:*-slim and does not ship wget/curl,
+          # so we don't use Docker --health-* flags (they would always fail).
+          # The next step polls /ping from the runner via curl instead.
           # --init is recommended by the upstream README for proper signal
           # handling of the Node.js process inside the container.
           docker run -d --rm \
@@ -54,25 +53,15 @@ jobs:
           docker logs bgutil-provider || true
           exit 1
 
-      - name: 🐍 Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: 📥 Install yt-dlp (nightly) + bgutil POT plugin
-        run: |
-          python3 -m pip install -U --pre "yt-dlp[default]"
-          # The youtubepot-bgutilhttp extractor-args used below come from this
-          # plugin. Without it, yt-dlp exits 1 with "no such PO Token Provider".
-          python3 -m pip install -U "bgutil-ytdlp-pot-provider"
-          python3 -m yt_dlp --version
-
-
-      - name: 🔑 Generate PO Token
+      - name: 🔑 Generate PO Token via provider HTTP API
         id: generate
         env:
           POT_PROVIDER_URL: http://127.0.0.1:4416
         run: |
+          # Calls POST /get_pot on the running bgutil provider. Token generation
+          # is local (Botguard JS challenge), so this works from CI runners
+          # whose IP YouTube has flagged for the web player — no video page
+          # scrape is needed.
           node scripts/get_potoken.js > potoken.json
           echo "--- potoken.json ---"
           cat potoken.json
@@ -95,14 +84,17 @@ jobs:
           fi
 
           VISITOR_DATA=$(jq -r '.visitorData // empty' potoken.json)
-          EXPIRES_AT=$(date -u -d '+6 hours' '+%Y-%m-%dT%H:%M:%SZ')
+          EXPIRES_AT=$(jq -r '.expiresAt // empty' potoken.json)
+          if [ -z "${EXPIRES_AT}" ]; then
+            EXPIRES_AT=$(date -u -d '+6 hours' '+%Y-%m-%dT%H:%M:%SZ')
+          fi
 
           BODY=$(jq -n \
             --arg pot "${POTOKEN}" \
             --arg vd  "${VISITOR_DATA}" \
             --arg exp "${EXPIRES_AT}" \
             '{potoken: $pot, expiresAt: $exp}
-             + (if $vd != "" then {visitorData: $vd} else {} end)')
+             + (if $vd != "" and $vd != "null" then {visitorData: $vd} else {} end)')
 
           echo "POST ${API_URL}/api/admin/potoken"
           echo "Body: ${BODY}"
