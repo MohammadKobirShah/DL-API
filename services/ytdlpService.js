@@ -63,15 +63,113 @@ class YtdlpService {
       this.exec(args).then((stdout) => {
         try {
           const info = JSON.parse(stdout);
-          const formats = (info.formats || []).map((f) => ({
-            format_id: f.format_id, ext: f.ext, resolution: f.resolution, fps: f.fps,
-            vcodec: f.vcodec, acodec: f.acodec, filesize: f.filesize, tbr: f.tbr,
-            format_note: f.format_note,
-          }));
-          resolve({ count: formats.length, formats });
+          const all = (info.formats || []).map((f) => this.normalizeFormat(f));
+
+          const isVideoOnly = (f) => f.vcodec && f.vcodec !== 'none' && (!f.acodec || f.acodec === 'none');
+          const isAudioOnly = (f) => f.acodec && f.acodec !== 'none' && (!f.vcodec || f.vcodec === 'none');
+          const isCombined  = (f) => f.vcodec && f.vcodec !== 'none' && f.acodec && f.acodec !== 'none';
+
+          const videoOnly = all.filter(isVideoOnly);
+          const audioOnly = all.filter(isAudioOnly);
+          const combined  = all.filter(isCombined);
+
+          const byHeightDesc = (a, b) => (b.height || 0) - (a.height || 0) || (b.tbr || 0) - (a.tbr || 0);
+          const byTbrDesc     = (a, b) => (b.tbr || b.abr || 0) - (a.tbr || a.abr || 0);
+          const byScoreDesc   = (a, b) => (b.score || 0) - (a.score || 0);
+
+          const bestVideo   = [...videoOnly].sort(byHeightDesc)[0] || null;
+          const bestAudio   = [...audioOnly].sort(byTbrDesc)[0] || null;
+          const bestCombined = [...combined].sort(byScoreDesc)[0] || null;
+
+          resolve({
+            url: info.webpage_url || url,
+            extractor: info.extractor,
+            extractor_key: info.extractor_key,
+            id: info.id,
+            title: info.title,
+            duration: info.duration,
+            duration_string: info.duration_string,
+            summary: {
+              total_formats: all.length,
+              video_only: videoOnly.length,
+              audio_only: audioOnly.length,
+              combined: combined.length,
+              best_video: bestVideo,
+              best_audio: bestAudio,
+              best_combined: bestCombined,
+            },
+            video_only: videoOnly,
+            audio_only: audioOnly,
+            combined,
+          });
         } catch (e) { reject(new Error('Failed to parse formats')); }
       }).catch(reject);
     });
+  }
+
+  async getRawDump(url) {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    return new Promise((resolve, reject) => {
+      const args = [
+        ...this.buildBaseArgs(), '--dump-json', '--no-warnings', '--skip-download',
+        '--no-playlist', url,
+      ];
+      this.exec(args).then((stdout) => {
+        try {
+          resolve(JSON.parse(stdout));
+        } catch (e) { reject(new Error('Failed to parse yt-dlp dump-json output')); }
+      }).catch(reject);
+    });
+  }
+
+  normalizeFormat(f) {
+    const isVideo = f.vcodec && f.vcodec !== 'none';
+    const isAudio = f.acodec && f.acodec !== 'none';
+    const filesize = f.filesize || f.filesize_approx || null;
+
+    const score =
+      (isVideo ? (f.height || 0) * (f.fps || 0) : 0) +
+      (isAudio ? (f.abr || f.tbr || 0) * 2 : 0);
+
+    return {
+      format_id: f.format_id,
+      format_note: f.format_note || null,
+      ext: f.ext,
+      container: f.container || null,
+      protocol: f.protocol || null,
+      resolution: f.resolution || null,
+      width: f.width || null,
+      height: f.height || null,
+      aspect_ratio: f.aspect_ratio || null,
+      fps: f.fps || null,
+      vcodec: f.vcodec || null,
+      acodec: f.acodec || null,
+      audio_channels: f.audio_channels || null,
+      audio_sample_rate: f.audio_sample_rate || f.asr || null,
+      tbr: f.tbr || null,
+      vbr: f.vbr || null,
+      abr: f.abr || null,
+      filesize,
+      filesize_human: filesize ? this.humanSize(filesize) : null,
+      dynamic_range: f.dynamic_range || null,
+      has_drm: !!f.has_drm,
+      language: f.language || null,
+      preference: f.preference ?? null,
+      quality: f.quality ?? null,
+      format: f.format || null,
+      manifest_url: f.manifest_url || null,
+      media_type: isVideo && isAudio ? 'combined' : isVideo ? 'video_only' : isAudio ? 'audio_only' : 'unknown',
+      score,
+    };
+  }
+
+  humanSize(bytes) {
+    if (!bytes || bytes <= 0) return null;
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let i = 0;
+    let n = bytes;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return `${n.toFixed(n >= 100 || i === 0 ? 0 : n >= 10 ? 1 : 2)} ${units[i]}`;
   }
 
   async search(query, limit = 10) {

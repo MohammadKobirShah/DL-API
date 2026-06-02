@@ -38,6 +38,7 @@ app.get('/', (req, res) => {
         'GET  /api/info?url=...',
         'GET  /api/embed?url=...',
         'GET  /api/formats?url=...',
+        'GET  /api/dump?url=...',
         'GET  /api/search?q=...&limit=10',
         'GET  /api/playlist?url=...',
         'GET  /api/thumbnail?url=...&quality=maxres',

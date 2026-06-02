@@ -310,7 +310,8 @@ DOWNLOAD_TIMEOUT_MS=1800000               # 30 min
 | ------ | --------------------------------- | --------------------------------------------------- |
 | `GET`  | `/api/info?url=...`               | Full video metadata (title, formats, embed, etc.)   |
 | `GET`  | `/api/embed?url=...`              | OEmbed-style embed object                           |
-| `GET`  | `/api/formats?url=...`            | All available formats with codecs & sizes           |
+| `GET`  | `/api/formats?url=...`            | All available formats grouped by media type + summary |
+| `GET`  | `/api/dump?url=...`               | Full raw `yt-dlp --dump-json` (every field)         |
 | `GET`  | `/api/search?q=...&limit=10`      | YouTube search (1–50 results)                       |
 | `GET`  | `/api/playlist?url=...`           | Flat playlist listing                               |
 | `GET`  | `/api/thumbnail?url=...&quality=` | Best/high/medium/default thumbnail                  |
@@ -422,6 +423,31 @@ curl -X POST http://localhost:3000/api/transcode \
 
 ```bash
 curl "http://localhost:3000/api/info?url=https://youtu.be/dQw4w9WgXcQ" | jq
+```
+
+### List all available formats (curated, grouped)
+
+```bash
+# Returns { video_only, audio_only, combined } arrays + a summary with the
+# best of each kind. Each format includes width/height/fps/codecs/bitrate/
+# protocol/filesize/dynamic_range/audio_channels/language/...
+curl "http://localhost:3000/api/formats?url=https://youtu.be/dQw4w9WgXcQ" | jq
+
+# Pull just the best video (highest resolution) and best audio from the
+# curated summary:
+curl "http://localhost:3000/api/formats?url=https://youtu.be/dQw4w9WgXcQ" \
+  | jq '.data.summary | {best_video, best_audio}'
+```
+
+### Get the full raw `dump.json` (every field yt-dlp emits)
+
+```bash
+# Heavy response — includes http_headers, downloader_options,
+# fragment_base_url, full thumbnails array, etc.
+curl "http://localhost:3000/api/dump?url=https://youtu.be/dQw4w9WgXcQ" | jq
+
+# Show only the format list from the raw dump:
+curl "http://localhost:3000/api/dump?url=https://youtu.be/dQw4w9WgXcQ" | jq '.data.formats | length'
 ```
 
 ### Search YouTube

@@ -58,6 +58,21 @@ router.get('/formats', async (req, res, next) => {
   } catch (err) { next(err); }
 });
 
+// GET /api/dump?url=...
+// Returns the full raw yt-dlp --dump-json output (all metadata, every
+// format with every field yt-dlp emits). Heavier than /api/info or
+// /api/formats — use this when you need fields the curated endpoints
+// don't expose (e.g. http_headers, downloader_options, fragment_base_url).
+router.get('/dump', async (req, res, next) => {
+  try {
+    const { url } = req.query;
+    if (!url) return res.status(400).json({ success: false, error: 'Missing url parameter' });
+    if (!validateUrl(url)) return res.status(400).json({ success: false, error: 'Invalid URL' });
+    const data = await ytdlp.getRawDump(url);
+    res.json({ success: true, data });
+  } catch (err) { next(err); }
+});
+
 router.get('/search', async (req, res, next) => {
   try {
     const { q, limit = 10 } = req.query;
