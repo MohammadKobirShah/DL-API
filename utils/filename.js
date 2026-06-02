@@ -37,4 +37,17 @@ function buildContentDisposition(title, suffix, tag = null) {
   return `attachment; filename="${asciiFallback}"; filename*=UTF-8''${utf8Name}`;
 }
 
-module.exports = { sanitizeTitle, safeFilename, buildContentDisposition };
+module.exports = { sanitizeTitle, safeFilename, buildContentDisposition, headerSafe };
+
+/**
+ * HTTP headers must be ASCII-only. For response headers that carry
+ * user-visible text (X-Suggested-Filename, X-Title, etc.), percent-encode
+ * any non-ASCII chars so the value round-trips through the wire without
+ * triggering ERR_INVALID_CHAR. Use ASCII fallback as a friendlier hint.
+ */
+function headerSafe(s) {
+  if (s === null || s === undefined) return '';
+  return String(s).replace(/[^\x20-\x7e]/g, (ch) =>
+    '%' + ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'),
+  );
+}

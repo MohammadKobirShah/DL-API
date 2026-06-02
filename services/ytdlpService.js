@@ -504,8 +504,8 @@ class YtdlpService {
     res.setHeader('Content-Type', mimeMap[ext] || (type === 'audio' ? 'audio/mpeg' : 'video/mp4'));
     res.setHeader('Content-Disposition', `attachment; filename="${suggested}"; filename*=UTF-8''${encodeURIComponent(suggested)}`);
     res.setHeader('Content-Length', stats.size);
-    res.setHeader('X-Suggested-Filename', suggested);
-    res.setHeader('X-Title', info?.title || '');
+    res.setHeader('X-Suggested-Filename', require('../utils/filename').headerSafe(suggested));
+    res.setHeader('X-Title', require('../utils/filename').headerSafe(info?.title || ''));
     res.setHeader('X-Embedded-Metadata', embed ? 'attempted' : 'skipped');
 
     const cleanup = () => { try { fs.unlinkSync(tmpPath); } catch {} };

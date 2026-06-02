@@ -228,7 +228,7 @@ router.get('/download/quality', async (req, res, next) => {
     res.setHeader('Content-Disposition', filename.buildContentDisposition(title, preset.suffix, quality));
     res.setHeader('Content-Type', mimeMap[preset.suffix] || 'application/octet-stream');
     res.setHeader('Content-Length', stats.size);
-    res.setHeader('X-Suggested-Filename', filename.safeFilename(title, preset.suffix, quality));
+    res.setHeader('X-Suggested-Filename', filename.headerSafe(filename.safeFilename(title, preset.suffix, quality)));
 
     const stream = fs.createReadStream(tempOutput);
     stream.pipe(res);
@@ -331,7 +331,7 @@ router.get('/download/resolution', async (req, res, next) => {
         res.setHeader('Content-Length', stats.size);
         res.setHeader('X-Merge-Mode', 'smart-merge');
         res.setHeader('X-Source-Format', `${smartFormat.format_id} (${smartFormat.width}x${smartFormat.height} ${smartFormat.vcodec || 'unknown'})`);
-        res.setHeader('X-Suggested-Filename', filename.safeFilename(title, preset.suffix, resolution));
+        res.setHeader('X-Suggested-Filename', filename.headerSafe(filename.safeFilename(title, preset.suffix, resolution)));
 
         const stream = fs.createReadStream(dlPath);
         stream.pipe(res);
@@ -407,7 +407,7 @@ router.get('/download/resolution', async (req, res, next) => {
     res.setHeader('Content-Length', stats.size);
     res.setHeader('X-Merge-Mode', 'transcode');
     res.setHeader('X-Source-Format', 'bestvideo+bestaudio');
-    res.setHeader('X-Suggested-Filename', filename.safeFilename(title, preset.suffix, resolution));
+    res.setHeader('X-Suggested-Filename', filename.headerSafe(filename.safeFilename(title, preset.suffix, resolution)));
 
     const stream = fs.createReadStream(tempOutput);
     stream.pipe(res);

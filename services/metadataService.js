@@ -136,7 +136,11 @@ async function embedMetadataInPlace(inputPath, info = {}, options = {}) {
     thumbPath = await downloadThumbnail(info.thumbnail);
   }
 
-  const tempOutput = inputPath + '.meta.tmp';
+  const ext = path.extname(inputPath);
+  // ffmpeg auto-detects the output container from the file extension, so
+  // the temp file must keep the original extension (`.tmp` is not a known
+  // format). The .meta segment lets the original / final files coexist.
+  const tempOutput = inputPath.slice(0, inputPath.length - ext.length) + '.meta' + ext;
   const ffmpegBin = config.ffmpegPath && config.ffmpegPath.length ? config.ffmpegPath : 'ffmpeg';
   const args = ['-y', '-i', inputPath];
   if (thumbPath) args.push('-i', thumbPath);
@@ -157,11 +161,11 @@ async function embedMetadataInPlace(inputPath, info = {}, options = {}) {
   args.push(...buildFfmpegMetadataArgs(info));
 
   // Container-specific tweaks
-  const ext = path.extname(inputPath).toLowerCase();
-  if (ext === '.mp4' || ext === '.m4a' || ext === '.mov') {
+  const extLower = ext.toLowerCase();
+  if (extLower === '.mp4' || extLower === '.m4a' || extLower === '.mov') {
     args.push('-movflags', '+faststart');
   }
-  if (ext === '.mp3') {
+  if (extLower === '.mp3') {
     args.push('-id3v2_version', '3');
     args.push('-write_id3v1', '1');
   }
