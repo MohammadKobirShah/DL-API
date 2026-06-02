@@ -23,30 +23,30 @@ jobs:
       - name: 🐳 Start bgutil PO Token provider
         id: bgutil
         run: |
+          # Note: no Docker-level --health-* flags; the bgutil image is based
+          # on node:*-slim and does not include wget/curl, so the in-container
+          # healthcheck command would always fail. The wait loop in the next
+          # step polls /ping from the runner via curl instead.
           docker run -d --rm \
             --name bgutil-provider \
             -p 4416:4416 \
-            --health-cmd "wget -qO- http://127.0.0.1:4416/ping || exit 1" \
-            --health-interval 5s \
-            --health-timeout 3s \
-            --health-retries 10 \
             brainicism/bgutil-ytdlp-pot-provider:latest
           CONTAINER_ID=$(docker inspect --format '{{.Id}}' bgutil-provider)
           echo "container_id=${CONTAINER_ID}" >> "$GITHUB_OUTPUT"
           echo "Started bgutil provider container ${CONTAINER_ID}"
 
-      - name: ⏳ Wait for provider to be healthy
+      - name: ⏳ Wait for provider /ping
         run: |
           for i in $(seq 1 30); do
-            STATUS=$(docker inspect --format '{{.State.Health.Status}}' bgutil-provider 2>/dev/null || echo "starting")
-            echo "Health status: ${STATUS} (attempt ${i}/30)"
-            if [ "${STATUS}" = "healthy" ]; then
-              echo "bgutil provider is healthy"
+            if curl -fsS --max-time 3 http://127.0.0.1:4416/ping >/dev/null 2>&1; then
+              PING_BODY=$(curl -fsS http://127.0.0.1:4416/ping)
+              echo "bgutil provider is up: ${PING_BODY}"
               exit 0
             fi
+            echo "Waiting for bgutil provider on 127.0.0.1:4416 ... (attempt ${i}/30)"
             sleep 2
           done
-          echo "::error::bgutil provider did not become healthy in 60s"
+          echo "::error::bgutil provider did not become ready in 60s"
           echo "--- container logs ---"
           docker logs bgutil-provider || true
           exit 1
