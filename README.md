@@ -470,6 +470,44 @@ curl "http://localhost:3000/api/search?q=lofi+beats&limit=5"
 
 ---
 
+## 🏷️ Auto-Embedded Metadata & Cover Art
+
+Every download (audio **and** video) is automatically tagged with the full
+yt-dlp metadata using `ffmpeg -c copy` — **no re-encoding**, the operation
+is lossless and adds only ~1–3 seconds.
+
+| Container | What gets embedded |
+|---|---|
+| **MP4 / M4A / MOV** | `title`, `artist`, `album`, `album_artist`, `composer`, `date`, `year`, `description`, `comment`, `synopsis`, `lyrics`, `genre`, `keywords`, `show`, `performer`, `copyright`, `publisher`, `encoded_by`, `tool`, `software`, `author`, `language`, `network=YouTube`, `source`, plus the **thumbnail as cover art** (`disposition:attached_pic`) |
+| **MP3** | Same fields, written as ID3v2.3 + ID3v1 (max compatibility) |
+| **WebM / MKV** | Same fields where supported; cover art attached when the container allows |
+| **Opus / FLAC / WAV** | Same fields via Vorbis comments / RIFF INFO |
+
+**Developer Credit** is embedded in five places so it shows up in any tag viewer:
+
+- `encoded_by` = `Mohammad Kobir Shah <https://github.com/MohammadKobirShah>`
+- `publisher` = `YT-DLP API Server by Mohammad Kobir Shah`
+- `author`    = `Mohammad Kobir Shah`
+- `comment`   = `Downloaded via YT-DLP API Server v2.2.0 — by Mohammad Kobir Shah (https://github.com/MohammadKobirShah)`
+- `software`  = `YT-DLP API Server v2.2.0 — crafted by Mohammad Kobir Shah`
+
+### Disable per-request or globally
+
+```bash
+# Skip embedding for one download
+curl ".../api/download?url=...&embed=false"
+
+# Disable for everyone (env var, .env, or Railway Variables)
+EMBED_METADATA=false
+```
+
+The thumbnail is fetched from YouTube's own CDN (maxresdefault.jpg when
+available) and embedded as `disposition:attached_pic` so it shows up as
+cover art in music players (mp3/m4a) and as cover/poster for video
+players that support it.
+
+---
+
 ## 🍪 Cookies & PO Token
 
 ### Upload cookies (Netscape format)

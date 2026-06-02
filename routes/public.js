@@ -7,6 +7,7 @@ const ytdlp = require('../services/ytdlpService');
 const potoken = require('../services/potokenService');
 const ffmpeg = require('../services/ffmpegService');
 const presets = require('../services/ffmpegPresets');
+const metadataSvc = require('../services/metadataService');
 const config = require('../config');
 const logger = require('../utils/logger');
 const filename = require('../utils/filename');
@@ -125,7 +126,7 @@ router.get('/subtitles', async (req, res, next) => {
 
 router.get('/download', async (req, res, next) => {
   try {
-    const { url, type = 'video', format, audioFormat = 'mp3' } = req.query;
+    const { url, type = 'video', format, audioFormat = 'mp3', embed = 'true' } = req.query;
     if (!url) return res.status(400).json({ success: false, error: 'Missing url parameter' });
     if (!validateUrl(url)) return res.status(400).json({ success: false, error: 'Invalid URL' });
 
@@ -133,32 +134,23 @@ router.get('/download', async (req, res, next) => {
       return res.status(503).json({ success: false, error: 'Audio extraction requires ffmpeg', hint: 'Install ffmpeg' });
     }
 
-    let ext;
-    if (type === 'audio') ext = audioFormat;
-    else if (format && format !== 'best') ext = (format.match(/ext=([a-z0-9]+)/i)?.[1]) || 'mp4';
-    else ext = 'mp4';
-
-    const title = await ytdlp.getTitle(url);
-    const suggestedName = filename.safeFilename(title, ext);
-    const mimeMap = { mp4:'video/mp4', webm:'video/webm', mkv:'video/x-matroska', mp3:'audio/mpeg', m4a:'audio/mp4', opus:'audio/opus', wav:'audio/wav', flac:'audio/flac' };
-    res.setHeader('Content-Disposition', filename.buildContentDisposition(title, ext));
-    res.setHeader('Content-Type', mimeMap[ext] || (type === 'audio' ? 'audio/mpeg' : 'video/mp4'));
-    res.setHeader('X-Suggested-Filename', suggestedName);
-    await ytdlp.streamDownload(url, res, { type, format, audioFormat });
+    const shouldEmbed = embed !== 'false' && metadataSvc.EMBED_ENABLED;
+    await ytdlp.streamWithEmbed(url, res, { type, format, audioFormat, embed: shouldEmbed });
   } catch (err) { next(err); }
 });
 
 router.get('/download/save', async (req, res, next) => {
   try {
-    const { url, type = 'video', format, audioFormat = 'mp3' } = req.query;
+    const { url, type = 'video', format, audioFormat = 'mp3', embed = 'true' } = req.query;
     if (!url) return res.status(400).json({ success: false, error: 'Missing url parameter' });
     if (!validateUrl(url)) return res.status(400).json({ success: false, error: 'Invalid URL' });
     if (type === 'audio' && !ffmpeg.isAvailable()) {
       return res.status(503).json({ success: false, error: 'Audio extraction requires ffmpeg' });
     }
     const title = await ytdlp.getTitle(url);
-    const result = await ytdlp.downloadToDisk(url, { type, format, audioFormat, title });
-    res.json({ success: true, data: { ...result, title } });
+    const shouldEmbed = embed !== 'false';
+    const result = await ytdlp.downloadToDisk(url, { type, format, audioFormat, title, embed: shouldEmbed });
+    res.json({ success: true, data: result });
   } catch (err) { next(err); }
 });
 
@@ -190,6 +182,9 @@ router.get('/download/quality', async (req, res, next) => {
     const tempInput = path.join(config.downloadDir, `${tempId}-src.%(ext)s`);
     const tempOutput = path.join(config.downloadDir, `${tempId}-${quality}.${preset.suffix}`);
     const title = await ytdlp.getTitle(url);
+    const probeInfo = (req.query.embed !== 'false' && metadataSvc.EMBED_ENABLED)
+      ? await ytdlp.getInfo(url).catch(() => null)
+      : null;
 
     logger.info(`[quality] Downloading source for ${quality} audio conversion...`);
     const dl = await new Promise((resolve, reject) => {
@@ -221,6 +216,11 @@ router.get('/download/quality', async (req, res, next) => {
     if (!result.success) {
       try { fs.unlinkSync(tempOutput); } catch {}
       return res.status(500).json({ success: false, error: 'Conversion failed', details: result.error });
+    }
+
+    if (req.query.embed !== 'false' && metadataSvc.EMBED_ENABLED && probeInfo) {
+      const embedResult = await metadataSvc.embedMetadataInPlace(tempOutput, probeInfo);
+      if (!embedResult.success) logger.warn(`[quality] embed failed: ${embedResult.error}`);
     }
 
     const stats = fs.statSync(tempOutput);
@@ -275,6 +275,8 @@ router.get('/download/resolution', async (req, res, next) => {
     const tempId = uuidv4();
     const mimeMap = { mp4: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska', gif: 'image/gif' };
     const title = await ytdlp.getTitle(url);
+    const shouldEmbed = req.query.embed !== 'false' && metadataSvc.EMBED_ENABLED;
+    const probeInfo = shouldEmbed ? await ytdlp.getInfo(url).catch(() => null) : null;
 
     // ============ Smart merge path ============
     if (mode !== 'transcode') {
@@ -320,6 +322,10 @@ router.get('/download/resolution', async (req, res, next) => {
         });
 
         const stats = fs.statSync(dlPath);
+        if (shouldEmbed && probeInfo) {
+          const embedResult = await metadataSvc.embedMetadataInPlace(dlPath, probeInfo);
+          if (!embedResult.success) logger.warn(`[resolution] embed failed: ${embedResult.error}`);
+        }
         res.setHeader('Content-Disposition', filename.buildContentDisposition(title, preset.suffix, resolution));
         res.setHeader('Content-Type', mimeMap[preset.suffix] || 'application/octet-stream');
         res.setHeader('Content-Length', stats.size);
@@ -388,6 +394,11 @@ router.get('/download/resolution', async (req, res, next) => {
     if (!result.success) {
       try { fs.unlinkSync(tempOutput); } catch {}
       return res.status(500).json({ success: false, error: 'Transcode failed', details: result.error });
+    }
+
+    if (shouldEmbed && probeInfo) {
+      const embedResult = await metadataSvc.embedMetadataInPlace(tempOutput, probeInfo);
+      if (!embedResult.success) logger.warn(`[resolution] embed failed: ${embedResult.error}`);
     }
 
     const stats = fs.statSync(tempOutput);

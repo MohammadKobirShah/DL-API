@@ -7,6 +7,7 @@ const logger = require('../utils/logger');
 const potoken = require('./potokenService');
 const storage = require('./storageService');
 const ffmpeg = require('./ffmpegService');
+const metadataSvc = require('./metadataService');
 
 function validateUrl(url) {
   if (typeof url !== 'string') return false;
@@ -377,18 +378,65 @@ class YtdlpService {
 
   async downloadToDisk(url, options = {}) {
     if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
-    const { type = 'video', format, audioFormat = 'mp3', audioBitrate = '192k', title = null } = options;
+    const {
+      type = 'video', format, audioFormat = 'mp3', audioBitrate = '192k',
+      title = null, embed = metadataSvc.EMBED_ENABLED,
+    } = options;
+    const { path: tmpPath, info } = await this._downloadToTempFile(url, { type, format, audioFormat, audioBitrate, probeInfo: !!title || embed });
+
+    if (embed && ffmpeg.isAvailable()) {
+      const r = await metadataSvc.embedMetadataInPlace(tmpPath, info || {});
+      if (!r.success) logger.warn(`[downloadToDisk] embed failed, returning un-embedded: ${r.error}`);
+    }
+
+    const finalExt = path.extname(tmpPath).slice(1);
+    const finalName = (() => {
+      if (!title) return path.basename(tmpPath);
+      const sanitized = require('../utils/filename').safeFilename(title, finalExt);
+      const newPath = path.join(config.downloadDir, sanitized);
+      try {
+        if (!fs.existsSync(newPath) && tmpPath !== newPath) {
+          fs.renameSync(tmpPath, newPath);
+          return sanitized;
+        }
+      } catch (e) {
+        logger.warn(`[downloadToDisk] rename failed, keeping UUID name: ${e.message}`);
+      }
+      return path.basename(tmpPath);
+    })();
+
+    return {
+      success: true,
+      filename: finalName,
+      url: `/downloads/${finalName}`,
+      path: path.join(config.downloadDir, finalName),
+      title: info?.title || title || 'video',
+      embedded: embed,
+    };
+  }
+
+  /**
+   * Download a URL to a temp file in config.downloadDir and (optionally)
+   * return the parsed yt-dlp info. Returns { path, info, ext }. The caller
+   * is responsible for cleaning up the temp file or streaming it.
+   */
+  async _downloadToTempFile(url, options = {}) {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    const { type = 'video', format, audioFormat = 'mp3', audioBitrate = '192k', probeInfo = false } = options;
     const id = uuidv4();
     const outputTemplate = path.join(config.downloadDir, `${id}.%(ext)s`);
 
-    return new Promise((resolve, reject) => {
+    let info = null;
+    if (probeInfo) {
+      try { info = await this.getInfo(url); } catch (e) { logger.warn(`[download] info probe failed: ${e.message}`); }
+    }
+
+    const downloadedPath = await new Promise((resolve, reject) => {
       const args = [
         ...this.buildBaseArgs(), '-o', outputTemplate, '--no-warnings', '--no-playlist',
       ];
       if (type === 'audio') {
-        if (!ffmpeg.isAvailable()) {
-          return reject(new Error('FFmpeg is required for audio extraction but was not found.'));
-        }
+        if (!ffmpeg.isAvailable()) return reject(new Error('FFmpeg is required for audio extraction but was not found.'));
         args.push('-x', '--audio-format', audioFormat, '--audio-quality', audioBitrate);
       } else if (format && format !== 'best') {
         args.push('-f', format);
@@ -405,46 +453,22 @@ class YtdlpService {
 
       const child = spawn(config.ytdlpPath, args, { windowsHide: true });
       let stderr = '';
-
       child.stderr.on('data', (data) => {
         const msg = data.toString();
         stderr += msg;
         const match = msg.match(/\[download\]\s+(\d+\.\d+)%/);
         if (match && options.onProgress) options.onProgress(parseFloat(match[1]));
       });
-
       child.on('close', (code) => {
         if (code === 0) {
           const allFiles = fs.readdirSync(config.downloadDir).filter((f) => f.startsWith(id));
           if (allFiles.length === 0) return reject(new Error('No output file found after download'));
-          const merged = allFiles.find((f) => f.endsWith('.mp4') || f.endsWith('.mkv') || f.endsWith('.webm'));
-          const finalExt = (merged || allFiles[0]).split('.').pop();
-          let finalName = merged || allFiles[0];
+          const merged = allFiles.find((f) => /\.(mp4|mkv|webm|m4a|mp3|opus|flac|wav)$/i.test(f));
+          const final = merged || allFiles[0];
           for (const f of allFiles) {
-            if (f !== finalName) try { fs.unlinkSync(path.join(config.downloadDir, f)); } catch {}
+            if (f !== final) try { fs.unlinkSync(path.join(config.downloadDir, f)); } catch {}
           }
-          // Rename on-disk to use the video title (sanitized)
-          if (title) {
-            const sanitized = require('../utils/filename').safeFilename(title, finalExt);
-            const oldPath = path.join(config.downloadDir, finalName);
-            const newPath = path.join(config.downloadDir, sanitized);
-            if (oldPath !== newPath) {
-              try {
-                if (!fs.existsSync(newPath)) {
-                  fs.renameSync(oldPath, newPath);
-                  finalName = sanitized;
-                }
-              } catch (e) {
-                logger.warn(`[downloadToDisk] could not rename to title: ${e.message}`);
-              }
-            }
-          }
-          resolve({
-            success: true,
-            filename: finalName,
-            url: `/downloads/${finalName}`,
-            path: path.join(config.downloadDir, finalName),
-          });
+          resolve(path.join(config.downloadDir, final));
         } else {
           const truncated = stderr.length > 500 ? stderr.slice(-500) : stderr;
           let errMsg = truncated || `yt-dlp exited with code ${code}`;
@@ -455,6 +479,45 @@ class YtdlpService {
         }
       });
       child.on('error', reject);
+    });
+
+    return { path: downloadedPath, info, ext: path.extname(downloadedPath).slice(1) };
+  }
+
+  async streamWithEmbed(url, res, options = {}) {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    const { type = 'video', format, audioFormat = 'mp3', embed = metadataSvc.EMBED_ENABLED } = options;
+    const { path: tmpPath, info, ext } = await this._downloadToTempFile(url, { type, format, audioFormat, probeInfo: embed });
+
+    if (embed && ffmpeg.isAvailable() && info) {
+      const r = await metadataSvc.embedMetadataInPlace(tmpPath, info);
+      if (!r.success) logger.warn(`[streamWithEmbed] embed failed, streaming without: ${r.error}`);
+    }
+
+    const stats = fs.statSync(tmpPath);
+    const mimeMap = {
+      mp4: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska',
+      mp3: 'audio/mpeg', m4a: 'audio/mp4', opus: 'audio/opus',
+      wav: 'audio/wav', flac: 'audio/flac',
+    };
+    const suggested = info?.title ? require('../utils/filename').safeFilename(info.title, ext) : `download-${uuidv4()}.${ext}`;
+    res.setHeader('Content-Type', mimeMap[ext] || (type === 'audio' ? 'audio/mpeg' : 'video/mp4'));
+    res.setHeader('Content-Disposition', `attachment; filename="${suggested}"; filename*=UTF-8''${encodeURIComponent(suggested)}`);
+    res.setHeader('Content-Length', stats.size);
+    res.setHeader('X-Suggested-Filename', suggested);
+    res.setHeader('X-Title', info?.title || '');
+    res.setHeader('X-Embedded-Metadata', embed ? 'attempted' : 'skipped');
+
+    const cleanup = () => { try { fs.unlinkSync(tmpPath); } catch {} };
+    res.on('close', cleanup);
+    res.on('error', cleanup);
+    const stream = fs.createReadStream(tmpPath);
+    stream.pipe(res);
+    stream.on('close', cleanup);
+    stream.on('error', (err) => {
+      logger.error('Stream error:', err.message);
+      cleanup();
+      if (!res.headersSent) try { res.status(500).json({ success: false, error: err.message }); } catch {}
     });
   }
 
