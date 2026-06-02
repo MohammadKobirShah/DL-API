@@ -1,0 +1,67 @@
+name: 🔄 Update PO Token
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+jobs:
+  update-potoken:
+    name: Generate & Update PO Token
+    runs-on: windows-latest
+
+    steps:
+      - name: 📥 Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 🟢 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: 🪟 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 📦 Install bgutil POT Provider
+        run: npm install -g bgutil-ytdlp-pot-provider
+
+      - name: 📦 Install yt-dlp
+        run: pip install yt-dlp
+
+      - name: 🔑 Generate PO Token
+        id: generate
+        run: |
+          node scripts/get_potoken.js > potoken.json
+          Get-Content potoken.json
+        shell: pwsh
+        env:
+          NODE_ENV: production
+
+      - name: 📤 POST PO Token to Server
+        if: success()
+        run: |
+          $tokenJson = Get-Content -Raw potoken.json
+          $parsed = $tokenJson | ConvertFrom-Json
+          $body = @{
+            potoken = $parsed.potoken
+            visitorData = $parsed.visitorData
+            expiresAt = (Get-Date).AddHours(6).ToString('o')
+          } | ConvertTo-Json
+
+          $headers = @{ "Content-Type" = "application/json" }
+          Invoke-RestMethod `
+            -Uri "${{ secrets.API_URL }}/api/admin/potoken" `
+            -Method Post `
+            -Headers $headers `
+            -Body $body
+        shell: pwsh
+
+      - name: ✅ Health Check
+        if: success()
+        run: |
+          $status = Invoke-RestMethod -Uri "${{ secrets.API_URL }}/health" -Method Get
+          Write-Host "Server status: $($status.status) ffmpeg=$($status.ffmpeg)"
+        shell: pwsh

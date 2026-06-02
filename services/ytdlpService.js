@@ -1,0 +1,389 @@
+const { spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const { v4: uuidv4 } = require('uuid');
+const config = require('../config');
+const logger = require('../utils/logger');
+const potoken = require('./potokenService');
+const storage = require('./storageService');
+const ffmpeg = require('./ffmpegService');
+
+function validateUrl(url) {
+  if (typeof url !== 'string') return false;
+  try {
+    const parsed = new URL(url);
+    if (!['http:', 'https:'].includes(parsed.protocol)) return false;
+    const host = parsed.hostname.toLowerCase();
+    if (['169.254.169.254','metadata.google.internal','localhost','127.0.0.1'].includes(host) || host.startsWith('::1')) {
+      return false;
+    }
+    return true;
+  } catch { return false; }
+}
+
+class YtdlpService {
+  constructor() {
+    if (!fs.existsSync(config.downloadDir)) {
+      fs.mkdirSync(config.downloadDir, { recursive: true });
+    }
+  }
+
+  buildBaseArgs() {
+    const args = potoken.getYtdlpArgs();
+    if (ffmpeg.isAvailable()) {
+      args.push('--ffmpeg-location', ffmpeg.getPath());
+    }
+    return args;
+  }
+
+  async getInfo(url, options = {}) {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    return new Promise((resolve, reject) => {
+      const args = [
+        ...this.buildBaseArgs(),
+        '--dump-json', '--no-warnings', '--no-playlist', '--skip-download',
+      ];
+      if (options.flatPlaylist) args.push('--flat-playlist');
+      args.push(url);
+      this.exec(args).then((stdout) => {
+        try {
+          const info = JSON.parse(stdout);
+          resolve(this.formatInfo(info));
+        } catch (e) { reject(new Error('Failed to parse yt-dlp output')); }
+      }).catch(reject);
+    });
+  }
+
+  async getFormats(url) {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    return new Promise((resolve, reject) => {
+      const args = [
+        ...this.buildBaseArgs(), '--dump-json', '--no-warnings', '--skip-download', url,
+      ];
+      this.exec(args).then((stdout) => {
+        try {
+          const info = JSON.parse(stdout);
+          const formats = (info.formats || []).map((f) => ({
+            format_id: f.format_id, ext: f.ext, resolution: f.resolution, fps: f.fps,
+            vcodec: f.vcodec, acodec: f.acodec, filesize: f.filesize, tbr: f.tbr,
+            format_note: f.format_note,
+          }));
+          resolve({ count: formats.length, formats });
+        } catch (e) { reject(new Error('Failed to parse formats')); }
+      }).catch(reject);
+    });
+  }
+
+  async search(query, limit = 10) {
+    return new Promise((resolve, reject) => {
+      const args = [
+        ...this.buildBaseArgs(), '--dump-json', '--no-warnings',
+        '--flat-playlist', '--skip-download', `ytsearch${limit}:${query}`,
+      ];
+      this.exec(args).then((stdout) => {
+        try {
+          const lines = stdout.trim().split('\n').filter(Boolean);
+          const results = lines.map((line) => JSON.parse(line)).map((info) => ({
+            id: info.id, title: info.title, url: info.url || info.webpage_url,
+            duration: info.duration, uploader: info.uploader || info.channel,
+            thumbnail: info.thumbnails?.[0]?.url || info.thumbnail, view_count: info.view_count,
+          }));
+          resolve(results);
+        } catch (e) { reject(e); }
+      }).catch(reject);
+    });
+  }
+
+  async getPlaylist(url) {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    return new Promise((resolve, reject) => {
+      const args = [
+        ...this.buildBaseArgs(), '--dump-json', '--no-warnings',
+        '--flat-playlist', '--skip-download', url,
+      ];
+      this.exec(args).then((stdout) => {
+        try {
+          const lines = stdout.trim().split('\n').filter(Boolean);
+          const items = lines.map((line) => JSON.parse(line));
+          resolve({
+            count: items.length,
+            items: items.map((info) => ({
+              id: info.id, title: info.title, url: info.url || info.webpage_url,
+              duration: info.duration, uploader: info.uploader,
+            })),
+          });
+        } catch (e) { reject(e); }
+      }).catch(reject);
+    });
+  }
+
+  async getSubtitles(url, lang = 'en') {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    return new Promise((resolve, reject) => {
+      const args = [
+        ...this.buildBaseArgs(), '--dump-json', '--no-warnings', '--skip-download',
+        '--write-subs', '--write-auto-subs', '--sub-langs', lang, url,
+      ];
+      this.exec(args).then((stdout) => {
+        try {
+          const info = JSON.parse(stdout);
+          resolve(info.subtitles || {});
+        } catch (e) { reject(e); }
+      }).catch(reject);
+    });
+  }
+
+  async streamDownload(url, res, options = {}) {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    const { format, type = 'video', audioFormat = 'mp3' } = options;
+
+    if (type === 'audio' && !ffmpeg.isAvailable()) {
+      throw new Error('Audio extraction requires ffmpeg, but it was not found.');
+    }
+
+    const args = [...this.buildBaseArgs(), '--no-warnings', '--no-playlist'];
+
+    if (type === 'audio') {
+      args.push('-x', '--audio-format', audioFormat, '-o', '-');
+    } else {
+      if (format && format !== 'best') {
+        args.push('-f', format);
+      } else {
+        if (!ffmpeg.isAvailable()) {
+          logger.warn('FFmpeg missing — falling back to single-file best format');
+          args.push('-f', 'best');
+        } else {
+          args.push('-f', 'bestvideo+bestaudio/best');
+          args.push('--merge-output-format', 'mp4');
+        }
+      }
+      args.push('-o', '-');
+    }
+    args.push(url);
+
+    logger.info(`Streaming: yt-dlp <args redacted>, type=${type}`);
+
+    const child = spawn(config.ytdlpPath, args, {
+      stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    });
+
+    let stderr = '';
+    let killed = false;
+    const cleanup = () => {
+      if (!killed && !child.killed) {
+        killed = true;
+        try { child.kill('SIGTERM'); } catch {}
+      }
+    };
+
+    res.on('close', cleanup);
+    res.on('error', cleanup);
+
+    child.stderr.on('data', (data) => { stderr += data.toString(); });
+
+    child.stdout.on('error', (err) => {
+      logger.error('Stream error:', err.message);
+      if (!res.headersSent) {
+        try { res.status(500).json({ success: false, error: err.message }); } catch {}
+      }
+      cleanup();
+    });
+
+    child.on('error', (err) => {
+      logger.error('yt-dlp spawn error:', err.message);
+      if (!res.headersSent) {
+        try { res.status(500).json({ success: false, error: err.message }); } catch {}
+      }
+      cleanup();
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0 && !res.headersSent) {
+        const truncated = stderr.length > 500 ? stderr.slice(-500) : stderr;
+        if (/ffmpeg|merge|post-?process/i.test(stderr)) {
+          logger.error(`yt-dlp failed (likely ffmpeg issue): ${truncated}`);
+          try {
+            res.status(500).json({
+              success: false,
+              error: 'Media processing failed. FFmpeg may be missing.',
+              details: truncated,
+            });
+          } catch {}
+        } else {
+          logger.error(`yt-dlp exited with code ${code}: ${truncated}`);
+          try {
+            res.status(500).json({ success: false, error: 'Download failed', details: truncated });
+          } catch {}
+        }
+      }
+    });
+
+    child.stdout.pipe(res);
+  }
+
+  async downloadToDisk(url, options = {}) {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    const { type = 'video', format, audioFormat = 'mp3', audioBitrate = '192k' } = options;
+    const id = uuidv4();
+    const outputTemplate = path.join(config.downloadDir, `${id}.%(ext)s`);
+
+    return new Promise((resolve, reject) => {
+      const args = [
+        ...this.buildBaseArgs(), '-o', outputTemplate, '--no-warnings', '--no-playlist',
+      ];
+      if (type === 'audio') {
+        if (!ffmpeg.isAvailable()) {
+          return reject(new Error('FFmpeg is required for audio extraction but was not found.'));
+        }
+        args.push('-x', '--audio-format', audioFormat, '--audio-quality', audioBitrate);
+      } else if (format && format !== 'best') {
+        args.push('-f', format);
+      } else {
+        if (!ffmpeg.isAvailable()) {
+          logger.warn('FFmpeg missing — using single-file best format');
+          args.push('-f', 'best');
+        } else {
+          args.push('-f', 'bestvideo+bestaudio/best');
+          args.push('--merge-output-format', 'mp4');
+        }
+      }
+      args.push(url);
+
+      const child = spawn(config.ytdlpPath, args, { windowsHide: true });
+      let stderr = '';
+
+      child.stderr.on('data', (data) => {
+        const msg = data.toString();
+        stderr += msg;
+        const match = msg.match(/\[download\]\s+(\d+\.\d+)%/);
+        if (match && options.onProgress) options.onProgress(parseFloat(match[1]));
+      });
+
+      child.on('close', (code) => {
+        if (code === 0) {
+          const allFiles = fs.readdirSync(config.downloadDir).filter((f) => f.startsWith(id));
+          if (allFiles.length === 0) return reject(new Error('No output file found after download'));
+          const merged = allFiles.find((f) => f.endsWith('.mp4') || f.endsWith('.mkv') || f.endsWith('.webm'));
+          const final = merged || allFiles[0];
+          for (const f of allFiles) {
+            if (f !== final) try { fs.unlinkSync(path.join(config.downloadDir, f)); } catch {}
+          }
+          resolve({
+            success: true,
+            filename: final,
+            url: `/downloads/${final}`,
+            path: path.join(config.downloadDir, final),
+          });
+        } else {
+          const truncated = stderr.length > 500 ? stderr.slice(-500) : stderr;
+          let errMsg = truncated || `yt-dlp exited with code ${code}`;
+          if (/ffmpeg|merge|post-?process/i.test(stderr) && !ffmpeg.isAvailable()) {
+            errMsg = `FFmpeg is required for this format but is not installed. ${errMsg}`;
+          }
+          reject(new Error(errMsg));
+        }
+      });
+      child.on('error', reject);
+    });
+  }
+
+  async convertFile(filename, options = {}) {
+    if (!ffmpeg.isAvailable()) throw new Error('FFmpeg is not available for conversion.');
+    const inputPath = path.join(config.downloadDir, filename);
+    if (!fs.existsSync(inputPath)) throw new Error(`File not found: ${filename}`);
+
+    const { outputFormat = 'mp3', codec, audioBitrate = '192k', videoCodec } = options;
+    const baseName = path.parse(filename).name;
+    const outputFilename = `${baseName}-converted-${Date.now()}.${outputFormat}`;
+    const outputPath = path.join(config.downloadDir, outputFilename);
+
+    const result = await ffmpeg.convert(inputPath, outputPath, { codec, audioBitrate, videoCodec });
+    if (!result.success) throw new Error(`Conversion failed: ${result.error}`);
+
+    return {
+      success: true,
+      filename: outputFilename,
+      url: `/downloads/${outputFilename}`,
+      path: outputPath,
+      size: result.size,
+    };
+  }
+
+  formatInfo(info) {
+    const aspect = (info.width && info.height && info.height > 0)
+      ? (info.width / info.height) : 16 / 9;
+    const safeHeight = Math.round(640 / aspect) || 360;
+
+    const sortedThumbs = (info.thumbnails || [])
+      .filter((t) => t && t.width)
+      .sort((a, b) => (b.width || 0) - (a.width || 0));
+    const bestThumb = sortedThumbs[0];
+
+    return {
+      id: info.id, title: info.title, description: info.description,
+      uploader: info.uploader || info.channel, uploader_id: info.uploader_id,
+      uploader_url: info.uploader_url || info.channel_url,
+      upload_date: info.upload_date, release_date: info.release_date, timestamp: info.timestamp,
+      duration: info.duration, duration_string: info.duration_string,
+      view_count: info.view_count, like_count: info.like_count,
+      comment_count: info.comment_count, channel_follower_count: info.channel_follower_count,
+      thumbnail: info.thumbnail, thumbnails: info.thumbnails,
+      tags: info.tags || [], categories: info.categories || [],
+      webpage_url: info.webpage_url, original_url: info.original_url,
+      extractor: info.extractor, extractor_key: info.extractor_key,
+      webpage_url_domain: info.webpage_url_domain,
+      is_live: info.is_live, was_live: info.was_live,
+      chapters: info.chapters || [],
+      subtitles: info.subtitles ? Object.keys(info.subtitles) : [],
+      automatic_captions: info.automatic_captions ? Object.keys(info.automatic_captions) : [],
+      capabilities: {
+        ffmpeg_available: ffmpeg.isAvailable(),
+        ffmpeg_version: ffmpeg.version,
+        supports_audio_extract: ffmpeg.isAvailable(),
+        supports_merge: ffmpeg.isAvailable(),
+      },
+      embed: {
+        type: 'video', version: '1.0', title: info.title,
+        author_name: info.uploader || info.channel,
+        author_url: info.uploader_url || info.channel_url,
+        provider_name: info.extractor, provider_url: info.extractor_key,
+        thumbnail_url: info.thumbnail,
+        thumbnail_width: bestThumb?.width, thumbnail_height: bestThumb?.height,
+        width: 640, height: safeHeight,
+        html: `<iframe src="${info.embed_url || info.webpage_url}" width="640" height="${safeHeight}" frameborder="0" allowfullscreen></iframe>`,
+        description: info.description?.substring(0, 200),
+      },
+      format_count: info.formats?.length || 0,
+      formats: (info.formats || []).map((f) => ({
+        format_id: f.format_id, ext: f.ext, resolution: f.resolution,
+        fps: f.fps, vcodec: f.vcodec, acodec: f.acodec, filesize: f.filesize, tbr: f.tbr,
+      })),
+    };
+  }
+
+  exec(args, timeoutMs = null) {
+    const timeout = timeoutMs || config.download.timeoutMs;
+    return new Promise((resolve, reject) => {
+      const child = spawn(config.ytdlpPath, args, { windowsHide: true });
+      let stdout = '';
+      let stderr = '';
+      const timer = setTimeout(() => {
+        try { child.kill('SIGTERM'); } catch {}
+        reject(new Error(`yt-dlp timed out after ${timeout}ms`));
+      }, timeout);
+      child.stdout.on('data', (data) => (stdout += data.toString()));
+      child.stderr.on('data', (data) => (stderr += data.toString()));
+      child.on('close', (code) => {
+        clearTimeout(timer);
+        if (code === 0) resolve(stdout);
+        else {
+          const truncated = stderr.length > 500 ? stderr.slice(-500) : stderr;
+          reject(new Error(truncated || `yt-dlp exited with code ${code}`));
+        }
+      });
+      child.on('error', (err) => { clearTimeout(timer); reject(err); });
+    });
+  }
+}
+
+module.exports = new YtdlpService();
