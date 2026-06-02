@@ -9,6 +9,7 @@ const ffmpeg = require('../services/ffmpegService');
 const presets = require('../services/ffmpegPresets');
 const config = require('../config');
 const logger = require('../utils/logger');
+const filename = require('../utils/filename');
 const { v4: uuidv4 } = require('uuid');
 
 function validateUrl(url) {
@@ -137,10 +138,12 @@ router.get('/download', async (req, res, next) => {
     else if (format && format !== 'best') ext = (format.match(/ext=([a-z0-9]+)/i)?.[1]) || 'mp4';
     else ext = 'mp4';
 
-    const filename = `download-${uuidv4()}.${ext}`;
+    const title = await ytdlp.getTitle(url);
+    const suggestedName = filename.safeFilename(title, ext);
     const mimeMap = { mp4:'video/mp4', webm:'video/webm', mkv:'video/x-matroska', mp3:'audio/mpeg', m4a:'audio/mp4', opus:'audio/opus', wav:'audio/wav', flac:'audio/flac' };
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Disposition', filename.buildContentDisposition(title, ext));
     res.setHeader('Content-Type', mimeMap[ext] || (type === 'audio' ? 'audio/mpeg' : 'video/mp4'));
+    res.setHeader('X-Suggested-Filename', suggestedName);
     await ytdlp.streamDownload(url, res, { type, format, audioFormat });
   } catch (err) { next(err); }
 });
@@ -153,8 +156,9 @@ router.get('/download/save', async (req, res, next) => {
     if (type === 'audio' && !ffmpeg.isAvailable()) {
       return res.status(503).json({ success: false, error: 'Audio extraction requires ffmpeg' });
     }
-    const result = await ytdlp.downloadToDisk(url, { type, format, audioFormat });
-    res.json({ success: true, data: result });
+    const title = await ytdlp.getTitle(url);
+    const result = await ytdlp.downloadToDisk(url, { type, format, audioFormat, title });
+    res.json({ success: true, data: { ...result, title } });
   } catch (err) { next(err); }
 });
 
@@ -185,6 +189,7 @@ router.get('/download/quality', async (req, res, next) => {
     const tempId = uuidv4();
     const tempInput = path.join(config.downloadDir, `${tempId}-src.%(ext)s`);
     const tempOutput = path.join(config.downloadDir, `${tempId}-${quality}.${preset.suffix}`);
+    const title = await ytdlp.getTitle(url);
 
     logger.info(`[quality] Downloading source for ${quality} audio conversion...`);
     const dl = await new Promise((resolve, reject) => {
@@ -220,9 +225,10 @@ router.get('/download/quality', async (req, res, next) => {
 
     const stats = fs.statSync(tempOutput);
     const mimeMap = { mp3: 'audio/mpeg', m4a: 'audio/mp4', opus: 'audio/opus', wav: 'audio/wav', flac: 'audio/flac' };
-    res.setHeader('Content-Disposition', `attachment; filename="audio-${quality}-${uuidv4()}.${preset.suffix}"`);
+    res.setHeader('Content-Disposition', filename.buildContentDisposition(title, preset.suffix, quality));
     res.setHeader('Content-Type', mimeMap[preset.suffix] || 'application/octet-stream');
     res.setHeader('Content-Length', stats.size);
+    res.setHeader('X-Suggested-Filename', filename.safeFilename(title, preset.suffix, quality));
 
     const stream = fs.createReadStream(tempOutput);
     stream.pipe(res);
@@ -268,6 +274,7 @@ router.get('/download/resolution', async (req, res, next) => {
     const preset = presets.VIDEO_PRESETS[resolution];
     const tempId = uuidv4();
     const mimeMap = { mp4: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska', gif: 'image/gif' };
+    const title = await ytdlp.getTitle(url);
 
     // ============ Smart merge path ============
     if (mode !== 'transcode') {
@@ -313,11 +320,12 @@ router.get('/download/resolution', async (req, res, next) => {
         });
 
         const stats = fs.statSync(dlPath);
-        res.setHeader('Content-Disposition', `attachment; filename="video-${resolution}-${uuidv4()}.${preset.suffix}"`);
+        res.setHeader('Content-Disposition', filename.buildContentDisposition(title, preset.suffix, resolution));
         res.setHeader('Content-Type', mimeMap[preset.suffix] || 'application/octet-stream');
         res.setHeader('Content-Length', stats.size);
         res.setHeader('X-Merge-Mode', 'smart-merge');
         res.setHeader('X-Source-Format', `${smartFormat.format_id} (${smartFormat.width}x${smartFormat.height} ${smartFormat.vcodec || 'unknown'})`);
+        res.setHeader('X-Suggested-Filename', filename.safeFilename(title, preset.suffix, resolution));
 
         const stream = fs.createReadStream(dlPath);
         stream.pipe(res);
@@ -383,11 +391,12 @@ router.get('/download/resolution', async (req, res, next) => {
     }
 
     const stats = fs.statSync(tempOutput);
-    res.setHeader('Content-Disposition', `attachment; filename="video-${resolution}-${uuidv4()}.${preset.suffix}"`);
+    res.setHeader('Content-Disposition', filename.buildContentDisposition(title, preset.suffix, resolution));
     res.setHeader('Content-Type', mimeMap[preset.suffix] || 'application/octet-stream');
     res.setHeader('Content-Length', stats.size);
     res.setHeader('X-Merge-Mode', 'transcode');
     res.setHeader('X-Source-Format', 'bestvideo+bestaudio');
+    res.setHeader('X-Suggested-Filename', filename.safeFilename(title, preset.suffix, resolution));
 
     const stream = fs.createReadStream(tempOutput);
     stream.pipe(res);
@@ -455,10 +464,10 @@ router.post('/convert', async (req, res, next) => {
     if (!ffmpeg.isAvailable()) {
       return res.status(503).json({ success: false, error: 'FFmpeg is not available' });
     }
-    const { filename, format = 'mp3', bitrate = '192k' } = req.query;
-    if (!filename) return res.status(400).json({ success: false, error: 'Missing filename parameter' });
-    const safeName = path.basename(filename);
-    if (safeName !== filename) return res.status(400).json({ success: false, error: 'Invalid filename' });
+    const { filename: fname, format = 'mp3', bitrate = '192k' } = req.query;
+    if (!fname) return res.status(400).json({ success: false, error: 'Missing filename parameter' });
+    const safeName = path.basename(fname);
+    if (safeName !== fname) return res.status(400).json({ success: false, error: 'Invalid filename' });
     const result = await ytdlp.convertFile(safeName, { outputFormat: format, audioBitrate: bitrate });
     res.json({ success: true, data: result });
   } catch (err) { next(err); }

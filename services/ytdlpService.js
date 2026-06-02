@@ -160,6 +160,24 @@ class YtdlpService {
     return matches[0];
   }
 
+  async getTitle(url) {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    return new Promise((resolve) => {
+      const args = [
+        ...this.buildBaseArgs(),
+        '--no-warnings', '--no-playlist', '--skip-download',
+        '--print', '%(title)s', url,
+      ];
+      this.exec(args).then((stdout) => {
+        const title = (stdout || '').trim().split('\n')[0];
+        resolve(title || 'video');
+      }).catch((err) => {
+        logger.warn(`[getTitle] probe failed, using fallback: ${err.message}`);
+        resolve('video');
+      });
+    });
+  }
+
   normalizeFormat(f) {
     const isVideo = f.vcodec && f.vcodec !== 'none';
     const isAudio = f.acodec && f.acodec !== 'none';
@@ -359,7 +377,7 @@ class YtdlpService {
 
   async downloadToDisk(url, options = {}) {
     if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
-    const { type = 'video', format, audioFormat = 'mp3', audioBitrate = '192k' } = options;
+    const { type = 'video', format, audioFormat = 'mp3', audioBitrate = '192k', title = null } = options;
     const id = uuidv4();
     const outputTemplate = path.join(config.downloadDir, `${id}.%(ext)s`);
 
@@ -400,15 +418,32 @@ class YtdlpService {
           const allFiles = fs.readdirSync(config.downloadDir).filter((f) => f.startsWith(id));
           if (allFiles.length === 0) return reject(new Error('No output file found after download'));
           const merged = allFiles.find((f) => f.endsWith('.mp4') || f.endsWith('.mkv') || f.endsWith('.webm'));
-          const final = merged || allFiles[0];
+          const finalExt = (merged || allFiles[0]).split('.').pop();
+          let finalName = merged || allFiles[0];
           for (const f of allFiles) {
-            if (f !== final) try { fs.unlinkSync(path.join(config.downloadDir, f)); } catch {}
+            if (f !== finalName) try { fs.unlinkSync(path.join(config.downloadDir, f)); } catch {}
+          }
+          // Rename on-disk to use the video title (sanitized)
+          if (title) {
+            const sanitized = require('../utils/filename').safeFilename(title, finalExt);
+            const oldPath = path.join(config.downloadDir, finalName);
+            const newPath = path.join(config.downloadDir, sanitized);
+            if (oldPath !== newPath) {
+              try {
+                if (!fs.existsSync(newPath)) {
+                  fs.renameSync(oldPath, newPath);
+                  finalName = sanitized;
+                }
+              } catch (e) {
+                logger.warn(`[downloadToDisk] could not rename to title: ${e.message}`);
+              }
+            }
           }
           resolve({
             success: true,
-            filename: final,
-            url: `/downloads/${final}`,
-            path: path.join(config.downloadDir, final),
+            filename: finalName,
+            url: `/downloads/${finalName}`,
+            path: path.join(config.downloadDir, finalName),
           });
         } else {
           const truncated = stderr.length > 500 ? stderr.slice(-500) : stderr;
