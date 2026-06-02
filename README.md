@@ -391,8 +391,20 @@ curl -o audio.mp3 "http://localhost:3000/api/download/quality?url=https://youtu.
 ### Transcode to 480p
 
 ```bash
+# Default (mode=auto): if a 480p source format exists, smart-merge with audio
+# (no ffmpeg re-encode). Falls back to ffmpeg transcode otherwise.
 curl -o video.mp4 "http://localhost:3000/api/download/resolution?url=https://youtu.be/dQw4w9WgXcQ&resolution=480p"
+
+# Force a re-encode even if 480p is available
+curl -o video.mp4 "http://localhost:3000/api/download/resolution?url=...&resolution=480p&mode=transcode"
+
+# Force smart-merge; 422 if no source format at the target height
+curl -o video.mp4 "http://localhost:3000/api/download/resolution?url=...&resolution=480p&mode=merge"
 ```
+
+The response includes two headers that tell you which path was taken:
+- `X-Merge-Mode`: `smart-merge` or `transcode`
+- `X-Source-Format`: the source `format_id` and codec (e.g. `137 (1920x1080 avc1.640028)`)
 
 ### Convert an existing file (POST)
 

@@ -122,6 +122,44 @@ class YtdlpService {
     });
   }
 
+  async findBestVideoAtHeight(url, targetHeight, outputContainer = 'mp4') {
+    if (!validateUrl(url)) throw new Error('Invalid URL. Only http(s) URLs are allowed.');
+    const data = await this.getFormats(url);
+    const pool = [...(data.video_only || []), ...(data.combined || [])];
+    const matches = pool.filter((f) => f.height === targetHeight);
+    if (matches.length === 0) return null;
+
+    const isAvc = (vc) => vc && vc.startsWith('avc1');
+    const isVp9 = (vc) => vc && (vc.startsWith('vp9') || vc.startsWith('vp09'));
+    const isHevc = (vc) => vc && (vc.startsWith('hev1') || vc.startsWith('hvc1'));
+    const isAv1  = (vc) => vc && (vc.startsWith('av01'));
+
+    const score = (f) => {
+      const mp4  = f.ext === 'mp4';
+      const webm = f.ext === 'webm';
+      if (outputContainer === 'mp4') {
+        if (mp4  && isAvc(f.vcodec))  return 100;
+        if (mp4  && isHevc(f.vcodec)) return 90;
+        if (mp4)                       return 80;
+        if (webm && isVp9(f.vcodec))   return 60;
+        if (webm && isAv1(f.vcodec))   return 50;
+        return 10;
+      }
+      if (outputContainer === 'webm') {
+        if (webm && isVp9(f.vcodec))  return 100;
+        if (webm && isAv1(f.vcodec))  return 90;
+        if (webm)                      return 80;
+        if (mp4  && isAvc(f.vcodec))  return 60;
+        if (mp4  && isVp9(f.vcodec))  return 50;
+        return 10;
+      }
+      return 10;
+    };
+
+    matches.sort((a, b) => score(b) - score(a));
+    return matches[0];
+  }
+
   normalizeFormat(f) {
     const isVideo = f.vcodec && f.vcodec !== 'none';
     const isAudio = f.acodec && f.acodec !== 'none';

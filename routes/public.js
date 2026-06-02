@@ -236,12 +236,21 @@ router.get('/download/quality', async (req, res, next) => {
 });
 
 // GET /api/download/resolution?url=...&resolution=480p
+//
+// Mode:
+//   - 'auto'    (default) — if a source format exists at the target height,
+//     pick the best one (MP4+AVC1 > MP4 > WebM+VP9) and merge with the best
+//     audio using yt-dlp's --merge-output-format. No ffmpeg transcode.
+//   - 'merge'   — force the smart merge path; if no matching format exists,
+//     422 with a clear error.
+//   - 'transcode' — always download bestvideo+bestaudio and re-encode with
+//     ffmpeg to the target resolution (original behavior).
 router.get('/download/resolution', async (req, res, next) => {
   try {
     if (!ffmpeg.isAvailable()) {
       return res.status(503).json({ success: false, error: 'FFmpeg is not available' });
     }
-    const { url, resolution = '480p', audioBitrate = '128k' } = req.query;
+    const { url, resolution = '480p', audioBitrate = '128k', mode = 'auto' } = req.query;
     if (!url) return res.status(400).json({ success: false, error: 'Missing url parameter' });
     if (!validateUrl(url)) return res.status(400).json({ success: false, error: 'Invalid URL' });
     if (!presets.VIDEO_PRESETS[resolution]) {
@@ -250,13 +259,92 @@ router.get('/download/resolution', async (req, res, next) => {
         available: Object.keys(presets.VIDEO_PRESETS),
       });
     }
+    if (!['auto', 'merge', 'transcode'].includes(mode)) {
+      return res.status(400).json({
+        success: false, error: `Unknown mode: ${mode}. Use one of: auto, merge, transcode`,
+      });
+    }
 
     const preset = presets.VIDEO_PRESETS[resolution];
     const tempId = uuidv4();
-    const tempInput = path.join(config.downloadDir, `${tempId}-src.%(ext)s`);
+    const mimeMap = { mp4: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska', gif: 'image/gif' };
+
+    // ============ Smart merge path ============
+    if (mode !== 'transcode') {
+      let smartFormat = null;
+      try {
+        smartFormat = await ytdlp.findBestVideoAtHeight(url, preset.height, preset.suffix);
+      } catch (e) {
+        logger.warn(`[resolution] format probe failed, using transcode fallback: ${e.message}`);
+      }
+
+      if (smartFormat) {
+        const inputTemplate = path.join(config.downloadDir, `${tempId}-src.%(ext)s`);
+        logger.info(
+          `[resolution] Smart merge: format ${smartFormat.format_id} ` +
+          `(${smartFormat.width}x${smartFormat.height} ${smartFormat.ext} ` +
+          `${smartFormat.vcodec || 'no-video'}) -> ${preset.suffix} (target ${resolution})`,
+        );
+
+        const dlPath = await new Promise((resolve, reject) => {
+          const args = [
+            ...ytdlp.buildBaseArgs(),
+            '-f', `${smartFormat.format_id}+bestaudio[ext=m4a]/${smartFormat.format_id}+bestaudio/best`,
+            '--merge-output-format', preset.suffix,
+            '-o', inputTemplate, '--no-warnings', '--no-playlist', url,
+          ];
+          const child = spawn(config.ytdlpPath, args, { windowsHide: true });
+          let stderr = '';
+          child.stderr.on('data', (d) => (stderr += d.toString()));
+          child.on('close', (code) => {
+            if (code === 0) {
+              const files = fs.readdirSync(config.downloadDir).filter((f) => f.startsWith(`${tempId}-src`));
+              const merged = files.find((f) => f.endsWith(`.${preset.suffix}`)) || files[0];
+              if (!merged) return reject(new Error('Downloaded file not found'));
+              resolve(path.join(config.downloadDir, merged));
+              for (const f of files) {
+                if (f !== merged) try { fs.unlinkSync(path.join(config.downloadDir, f)); } catch {}
+              }
+            } else {
+              reject(new Error(stderr.slice(-300) || `yt-dlp exited ${code}`));
+            }
+          });
+          child.on('error', reject);
+        });
+
+        const stats = fs.statSync(dlPath);
+        res.setHeader('Content-Disposition', `attachment; filename="video-${resolution}-${uuidv4()}.${preset.suffix}"`);
+        res.setHeader('Content-Type', mimeMap[preset.suffix] || 'application/octet-stream');
+        res.setHeader('Content-Length', stats.size);
+        res.setHeader('X-Merge-Mode', 'smart-merge');
+        res.setHeader('X-Source-Format', `${smartFormat.format_id} (${smartFormat.width}x${smartFormat.height} ${smartFormat.vcodec || 'unknown'})`);
+
+        const stream = fs.createReadStream(dlPath);
+        stream.pipe(res);
+        stream.on('close', () => { try { fs.unlinkSync(dlPath); } catch {} });
+        stream.on('error', (err) => {
+          logger.error('Stream error:', err.message);
+          try { fs.unlinkSync(dlPath); } catch {}
+          if (!res.headersSent) res.status(500).json({ success: false, error: err.message });
+        });
+        return;
+      }
+
+      if (mode === 'merge') {
+        return res.status(422).json({
+          success: false,
+          error: `No source format available at ${preset.height}p to merge — try mode=transcode or a different resolution`,
+          resolution,
+        });
+      }
+      logger.info(`[resolution] No source format at ${preset.height}p, falling back to transcode`);
+    }
+
+    // ============ Transcode path (fallback / forced) ============
+    const tempInput  = path.join(config.downloadDir, `${tempId}-src.%(ext)s`);
     const tempOutput = path.join(config.downloadDir, `${tempId}-${resolution}.${preset.suffix}`);
 
-    logger.info(`[resolution] Downloading source for ${resolution}...`);
+    logger.info(`[resolution] Transcode path: downloading bestvideo+bestaudio for ${resolution} (${preset.width}x${preset.height})...`);
     const dl = await new Promise((resolve, reject) => {
       const args = [
         ...ytdlp.buildBaseArgs(), '-f', 'bestvideo+bestaudio/best',
@@ -295,10 +383,11 @@ router.get('/download/resolution', async (req, res, next) => {
     }
 
     const stats = fs.statSync(tempOutput);
-    const mimeMap = { mp4: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska', gif: 'image/gif' };
     res.setHeader('Content-Disposition', `attachment; filename="video-${resolution}-${uuidv4()}.${preset.suffix}"`);
     res.setHeader('Content-Type', mimeMap[preset.suffix] || 'application/octet-stream');
     res.setHeader('Content-Length', stats.size);
+    res.setHeader('X-Merge-Mode', 'transcode');
+    res.setHeader('X-Source-Format', 'bestvideo+bestaudio');
 
     const stream = fs.createReadStream(tempOutput);
     stream.pipe(res);
