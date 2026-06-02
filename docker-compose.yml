@@ -1,0 +1,107 @@
+# ===================================================================
+# DL-API — docker-compose definition
+# Services:
+#   - bgutil-provider : official PO Token provider (sidecar)
+#   - ytdlp-api       : the YT-DLP API server (this project)
+#
+# Usage:
+#   docker compose up -d                             # build & start
+#   docker compose logs -f ytdlp-api                 # tail app logs
+#   docker compose down                              # stop & remove
+#   docker compose build --build-arg YTDLP_CHANNEL=stable   # switch channel
+# ===================================================================
+
+services:
+  # -----------------------------------------------------------------
+  # PO Token provider — official upstream image
+  # https://hub.docker.com/r/brainicism/bgutil-ytdlp-pot-provider
+  # -----------------------------------------------------------------
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    container_name: dl-api-bgutil
+    restart: unless-stopped
+    init: true
+    networks:
+      - dl-api-net
+    # Port 4416 stays inside the network (only ytdlp-api needs it)
+    # To expose for debugging: uncomment below
+    # ports:
+    #   - "4416:4416"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:4416/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # -----------------------------------------------------------------
+  # DL-API — YT-DLP API server
+  # -----------------------------------------------------------------
+  ytdlp-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        # nightly (default) | master | stable
+        YTDLP_CHANNEL: nightly
+    image: dl-api:latest
+    container_name: dl-api
+    restart: unless-stopped
+
+    depends_on:
+      bgutil-provider:
+        condition: service_started
+
+    networks:
+      - dl-api-net
+
+    ports:
+      - "3000:3000"
+
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      TZ: UTC
+      YT_DLP_PATH: yt-dlp
+      FFMPEG_PATH: ""                                    # auto-detect
+      POTOKEN_PROVIDER_URL: http://bgutil-provider:4416  # sidecar address
+      POTOKEN_PROVIDER_AUTO_START: "false"               # external sidecar
+      DATA_DIR: /app/data
+      COOKIES_FILE: /app/data/cookies.txt
+      DOWNLOAD_DIR: /app/downloads
+      MAX_DOWNLOAD_DURATION_SEC: "21600"
+      DOWNLOAD_TIMEOUT_MS: "1800000"
+
+    # Optional: load secrets / overrides from .env in project root
+    env_file:
+      - path: .env
+        required: false
+
+    volumes:
+      - ./data:/app/data
+      - ./downloads:/app/downloads
+      - ./logs:/app/logs
+
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    # Optional resource limits — tune for your host
+    # deploy:
+    #   resources:
+    #     limits:
+    #       cpus: "2.0"
+    #       memory: 2G
+
+networks:
+  dl-api-net:
+    driver: bridge

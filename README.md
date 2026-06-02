@@ -18,7 +18,7 @@
 [![GitHub Forks](https://img.shields.io/github/forks/MohammadKobirShah/DL-API?style=social)](https://github.com/MohammadKobirShah/DL-API/network)
 [![GitHub Issues](https://img.shields.io/github/issues/MohammadKobirShah/DL-API?style=social&logo=github)](https://github.com/MohammadKobirShah/DL-API/issues)
 
-[**🚀 Quick Start**](#-quick-start) • [**📚 API Docs**](#-api-endpoints) • [**🎨 Presets**](#-quality-presets) • [**🐳 Deploy**](#-deployment) • [**🛠 Architecture**](#-architecture) • [**👨‍💻 Developer**](#-developer)
+[**🚀 Quick Start**](#-quick-start) • [**🐳 Docker**](#-docker) • [**📚 API Docs**](#-api-endpoints) • [**🎨 Presets**](#-quality-presets) • [**🚢 Deploy**](#-deployment) • [**👨‍💻 Developer**](#-developer)
 
 ---
 
@@ -64,11 +64,12 @@
 - [✨ Features](#-features)
 - [🛠 Tech Stack](#-tech-stack)
 - [🚀 Quick Start](#-quick-start)
+- [🐳 Docker](#-docker)
 - [⚙️ Configuration](#️-configuration)
 - [📚 API Endpoints](#-api-endpoints)
 - [🎨 Quality Presets](#-quality-presets)
 - [🍪 Cookies & PO Token](#-cookies--po-token)
-- [🐳 Deployment](#-deployment)
+- [🚢 Deployment](#-deployment)
 - [🛠 Architecture](#-architecture)
 - [📂 Project Structure](#-project-structure)
 - [🤝 Contributing](#-contributing)
@@ -165,6 +166,115 @@ pm2 start ecosystem.config.cjs   # 24/7 production
 pm2 save && pm2 startup
 ```
 </details>
+
+---
+
+## 🐳 Docker
+
+The fastest, zero-friction way to run DL-API — **everything bundled** (Node.js 20 + ffmpeg + yt-dlp **nightly**) on Debian Bookworm slim, with the official PO Token provider running as a **sidecar** container.
+
+### 🚀 One-shot run with docker compose
+
+```bash
+git clone https://github.com/MohammadKobirShah/DL-API.git
+cd DL-API
+docker compose up -d
+```
+
+That's it. The API is live on **http://localhost:3000**. Compose spins up:
+
+| Service           | Image                                         | Purpose                            |
+| ----------------- | --------------------------------------------- | ---------------------------------- |
+| `ytdlp-api`       | `dl-api:latest` (built from `Dockerfile`)     | The YT-DLP API server              |
+| `bgutil-provider` | `brainicism/bgutil-ytdlp-pot-provider:latest` | PO Token generator (port 4416, internal) |
+
+Bundled inside `ytdlp-api`:
+
+| Component           | Version channel                                 |
+| ------------------- | ----------------------------------------------- |
+| Node.js             | 20 LTS                                          |
+| FFmpeg / ffprobe    | Debian package (5.x)                            |
+| yt-dlp              | **nightly** (`yt-dlp_linux` standalone binary)  |
+| tini                | PID 1 init                                      |
+
+### 🔧 Switch yt-dlp channel
+
+```bash
+# Nightly (default)
+docker compose build --build-arg YTDLP_CHANNEL=nightly
+
+# Master
+docker compose build --build-arg YTDLP_CHANNEL=master
+
+# Stable
+docker compose build --build-arg YTDLP_CHANNEL=stable
+```
+
+### 🏛 Multi-arch support
+
+The Dockerfile auto-detects architecture and pulls the right binary:
+
+| Platform   | yt-dlp binary             |
+| ---------- | ------------------------- |
+| `amd64`    | `yt-dlp_linux`            |
+| `arm64`    | `yt-dlp_linux_aarch64`    |
+| `armhf`    | `yt-dlp_linux_armv7l`     |
+
+### 📂 Volumes (auto-created on host)
+
+| Host path        | Container path     | Purpose                          |
+| ---------------- | ------------------ | -------------------------------- |
+| `./data`         | `/app/data`        | PO Token + visitor + cookies     |
+| `./downloads`    | `/app/downloads`   | Saved media files                |
+| `./logs`         | `/app/logs`        | App logs                         |
+
+If you hit permission issues: `sudo chown -R 1000:1000 ./data ./downloads ./logs`
+
+### 🛠 Useful commands
+
+```bash
+docker compose up -d                              # start in background
+docker compose logs -f ytdlp-api                  # tail app logs
+docker compose logs -f bgutil-provider            # tail provider logs
+docker compose ps                                 # status + healthcheck
+docker compose exec ytdlp-api sh                  # shell into the container
+docker compose restart                            # restart both services
+docker compose down                               # stop & remove
+docker compose pull && docker compose up -d --build   # update
+```
+
+### 🩺 Verify it works
+
+```bash
+curl http://localhost:3000/health
+# → {"status":"ok","uptime":12.3,"timestamp":...,"ffmpeg":true}
+
+curl "http://localhost:3000/api/info?url=https://youtu.be/dQw4w9WgXcQ" | jq .data.title
+```
+
+### 🐋 Build & run standalone (without compose)
+
+```bash
+# Build
+docker build -t dl-api:nightly --build-arg YTDLP_CHANNEL=nightly .
+
+# Run PO Token provider sidecar
+docker run -d --name bgutil --restart unless-stopped \
+  brainicism/bgutil-ytdlp-pot-provider:latest
+
+# Run the API, linked to the provider
+docker run -d \
+  --name dl-api \
+  -p 3000:3000 \
+  --link bgutil \
+  -e POTOKEN_PROVIDER_URL=http://bgutil:4416 \
+  -e POTOKEN_PROVIDER_AUTO_START=false \
+  -v "$PWD/data:/app/data" \
+  -v "$PWD/downloads:/app/downloads" \
+  -v "$PWD/logs:/app/logs" \
+  --restart unless-stopped \
+  dl-api:nightly
+```
 
 ---
 
@@ -363,7 +473,7 @@ A workflow at `.github/workflows/potoken-update.yml` runs **every 6 hours**, gen
 
 ---
 
-## 🐳 Deployment
+## 🚢 Deployment
 
 ### 🟢 PM2 (Recommended for VPS)
 
@@ -456,6 +566,9 @@ server {
 DL-API/
 ├── server.js                       # Main entry point
 ├── ecosystem.config.cjs            # PM2 config
+├── Dockerfile                      # Multi-arch Debian-based image
+├── docker-compose.yml              # One-shot deployment
+├── .dockerignore
 ├── package.json
 ├── .env.example
 │

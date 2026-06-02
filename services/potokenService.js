@@ -38,6 +38,13 @@ class PoTokenService {
         windowsHide: true,
       });
 
+      this.providerProcess.on('error', (err) => {
+        logger.error(`PO Token provider failed to start: ${err.message}`);
+        logger.info('Hint: run the provider as a separate container/process, or set POTOKEN_PROVIDER_AUTO_START=false');
+        this.providerProcess = null;
+        this.lastHealthStatus = false;
+      });
+
       this.providerProcess.stdout?.on('data', (data) => {
         logger.info(`[POT-Provider] ${data.toString().trim()}`);
       });
