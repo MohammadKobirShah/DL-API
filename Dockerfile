@@ -89,7 +89,8 @@ USER node
 
 EXPOSE 3000
 
-VOLUME ["/app/data", "/app/downloads", "/app/logs"]
+# Note: Use platform-native volumes (Railway Volumes, K8s PVC, docker-compose
+# bind mounts) for /app/data, /app/downloads, /app/logs persistence.
 
 # -------------------------------------------------------------------
 # Healthcheck (uses /health endpoint)
