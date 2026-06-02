@@ -2,9 +2,9 @@
  * Get a PO Token by talking to an already-running bgutil-ytdlp-pot-provider.
  *
  * The GitHub Action (and docker-compose) is responsible for starting the
- * provider container. This script just waits for it, then runs yt-dlp
- * against a small test video using the bgutil extractor plugin, and parses
- * the resulting JSON for the PO Token + visitor data.
+ * provider container. This script waits for it, then runs yt-dlp against a
+ * small test video using the bgutil extractor plugin (youtubepot-bgutilhttp),
+ * and parses the resulting JSON for the PO Token + visitor data.
  *
  * Output (stdout): { "potoken": "...", "visitorData": "..." | null }
  *
@@ -12,7 +12,7 @@
  *   POT_PROVIDER_URL  - base URL of the running provider (default http://127.0.0.1:4416)
  */
 
-const { execSync } = require('child_process');
+const { spawn } = require('child_process');
 const http = require('http');
 
 const PROVIDER_URL = (process.env.POT_PROVIDER_URL || 'http://127.0.0.1:4416').replace(/\/+$/, '');
@@ -21,6 +21,7 @@ const TEST_VIDEO = 'https://www.youtube.com/watch?v=jNQXAC9IVRw';
 
 const READY_TIMEOUT_MS = 60000;
 const READY_POLL_MS = 1000;
+const YTDLP_TIMEOUT_MS = 120000;
 
 function extractJsonObject(output) {
   const start = output.indexOf('{');
@@ -60,6 +61,53 @@ function waitForServer(url, timeoutMs) {
   });
 }
 
+function runYtdlp(providerUrl, videoUrl) {
+  return new Promise((resolve, reject) => {
+    const args = [
+      '-v',
+      `--extractor-args`, `youtubepot-bgutilhttp:base_url=${providerUrl}`,
+      '--dump-json',
+      '--skip-download',
+      '--no-warnings',
+      videoUrl,
+    ];
+
+    const child = spawn('yt-dlp', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    let killed = false;
+
+    const killTimer = setTimeout(() => {
+      killed = true;
+      child.kill('SIGKILL');
+    }, YTDLP_TIMEOUT_MS);
+
+    child.stdout.on('data', (b) => { stdout += b.toString(); });
+    child.stderr.on('data', (b) => {
+      const s = b.toString();
+      stderr += s;
+      process.stderr.write(`[yt-dlp] ${s}`);
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(killTimer);
+      reject(new Error(`Failed to spawn yt-dlp: ${err.message}`));
+    });
+
+    child.on('close', (code, signal) => {
+      clearTimeout(killTimer);
+      if (killed) {
+        return reject(new Error(`yt-dlp timed out after ${YTDLP_TIMEOUT_MS}ms`));
+      }
+      if (code === 0) {
+        return resolve({ stdout, stderr });
+      }
+      const tail = stderr.trim().split('\n').slice(-25).join('\n');
+      reject(new Error(`yt-dlp exited with code ${code}${signal ? ` (signal ${signal})` : ''}\n${tail}`));
+    });
+  });
+}
+
 async function main() {
   try {
     console.error(`[get_potoken] Waiting for bgutil provider at ${PING_URL} ...`);
@@ -68,27 +116,19 @@ async function main() {
 
     console.error('[get_potoken] Provider ready. Generating token via yt-dlp ...');
 
-    const cmd = [
-      'yt-dlp',
-      '-v',
-      `--extractor-args "youtubepot-bgutilhttp:base_url=${PROVIDER_URL}"`,
-      '--dump-json',
-      '--skip-download',
-      '--no-warnings',
-      `"${TEST_VIDEO}"`,
-      '2>&1',
-    ].join(' ');
+    const { stdout } = await runYtdlp(PROVIDER_URL, TEST_VIDEO);
 
-    const output = execSync(cmd, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, shell: true });
-
-    const jsonStr = extractJsonObject(output);
-    if (!jsonStr) throw new Error('No JSON object found in yt-dlp output');
+    const jsonStr = extractJsonObject(stdout);
+    if (!jsonStr) {
+      const tail = stdout.trim().split('\n').slice(-20).join('\n');
+      throw new Error(`No JSON object found in yt-dlp stdout. Last 20 lines:\n${tail}`);
+    }
 
     const info = JSON.parse(jsonStr);
     const potoken = info.po_token || info.pot;
     const visitorData = info.visitor_data || info.visitorData || null;
 
-    if (!potoken) throw new Error('Could not extract PO token from yt-dlp output');
+    if (!potoken) throw new Error('Could not extract PO token from yt-dlp output (no po_token field)');
 
     process.stdout.write(JSON.stringify({ potoken, visitorData }));
     process.stdout.write('\n');
