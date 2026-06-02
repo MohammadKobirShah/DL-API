@@ -1,16 +1,26 @@
 /**
- * Get a PO Token using the bgutil-ytdlp-pot-provider.
- * Called by the GitHub Action.
- * Output: JSON to stdout: { "potoken": "...", "visitorData": "..." }
+ * Get a PO Token by talking to an already-running bgutil-ytdlp-pot-provider.
+ *
+ * The GitHub Action (and docker-compose) is responsible for starting the
+ * provider container. This script just waits for it, then runs yt-dlp
+ * against a small test video using the bgutil extractor plugin, and parses
+ * the resulting JSON for the PO Token + visitor data.
+ *
+ * Output (stdout): { "potoken": "...", "visitorData": "..." | null }
+ *
+ * Required env:
+ *   POT_PROVIDER_URL  - base URL of the running provider (default http://127.0.0.1:4416)
  */
 
-const { spawn, execSync } = require('child_process');
-const path = require('path');
-const fs = require('fs');
+const { execSync } = require('child_process');
 const http = require('http');
 
-const PROVIDER_PORT = 4416;
+const PROVIDER_URL = (process.env.POT_PROVIDER_URL || 'http://127.0.0.1:4416').replace(/\/+$/, '');
+const PING_URL = `${PROVIDER_URL}/ping`;
 const TEST_VIDEO = 'https://www.youtube.com/watch?v=jNQXAC9IVRw';
+
+const READY_TIMEOUT_MS = 60000;
+const READY_POLL_MS = 1000;
 
 function extractJsonObject(output) {
   const start = output.indexOf('{');
@@ -30,93 +40,61 @@ function extractJsonObject(output) {
   return null;
 }
 
-function extractPotFromLogs(output) {
-  const patterns = [
-    /po[_\s]?token["']?\s*[:=]\s*["']?([A-Za-z0-9_\-=\.]+)/i,
-    /"pot"\s*:\s*"([^"]+)"/i,
-    /"poToken"\s*:\s*"([^"]+)"/i,
-  ];
-  for (const p of patterns) {
-    const m = output.match(p);
-    if (m) return m[1];
-  }
-  return null;
-}
-
-function extractVisitorData(output) {
-  const m = output.match(/"visitor[_-]?data"\s*:\s*"([^"]+)"/i);
-  return m ? m[1] : null;
-}
-
-async function waitForServer(url, timeoutMs = 30000) {
+function waitForServer(url, timeoutMs) {
   const start = Date.now();
-  while (Date.now() - start < timeoutMs) {
-    try {
-      await new Promise((resolve, reject) => {
-        const req = http.get(url, (res) => {
-          if (res.statusCode === 200 || res.statusCode === 404) resolve();
-          else reject(new Error(`Status: ${res.statusCode}`));
-        });
-        req.on('error', reject);
-        req.setTimeout(2000, () => req.destroy(new Error('Timeout')));
+  return new Promise((resolve) => {
+    const tick = () => {
+      const req = http.get(url, (res) => {
+        res.resume();
+        if (res.statusCode && res.statusCode < 500) return resolve(true);
+        retry();
       });
-      return true;
-    } catch (e) {
-      await new Promise((r) => setTimeout(r, 1000));
-    }
-  }
-  return false;
-}
-
-async function getTokenViaProvider() {
-  console.error('[get_potoken] Starting bgutil-ytdlp-pot-provider...');
-  let provider;
-  try {
-    const globalRoot = execSync('npm root -g').toString().trim();
-    const providerPath = path.join(globalRoot, 'bgutil-ytdlp-pot-provider');
-    if (!fs.existsSync(providerPath)) {
-      throw new Error('bgutil-ytdlp-pot-provider not installed globally');
-    }
-
-    provider = spawn('node', [path.join(providerPath, 'dist', 'cjs', 'server.js')], {
-      stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
-    });
-    provider.stdout.on('data', (d) => process.stderr.write(`[provider] ${d}`));
-    provider.stderr.on('data', (d) => process.stderr.write(`[provider-err] ${d}`));
-
-    const ready = await waitForServer(`http://127.0.0.1:${PROVIDER_PORT}/ping`);
-    if (!ready) throw new Error('Provider failed to start');
-
-    console.error('[get_potoken] Provider ready. Generating token via yt-dlp...');
-
-    const cmd = `yt-dlp -v --extractor-args "youtubepot-bgutilhttp:base_url=http://127.0.0.1:${PROVIDER_PORT}" --dump-json --skip-download --no-warnings "${TEST_VIDEO}" 2>&1`;
-    const output = execSync(cmd, { encoding: 'utf8', maxBuffer: 50 * 1024 * 1024, shell: true });
-
-    const jsonStr = extractJsonObject(output);
-    if (!jsonStr) throw new Error('No JSON object found in yt-dlp output');
-    const info = JSON.parse(jsonStr);
-
-    let potoken = info.po_token || info.pot;
-    let visitorData = info.visitor_data || info.visitorData;
-
-    if (!potoken) potoken = extractPotFromLogs(output);
-    if (!visitorData) visitorData = extractVisitorData(output);
-
-    if (!potoken) throw new Error('Could not extract PO token from output');
-
-    return { potoken, visitorData };
-  } finally {
-    if (provider) try { provider.kill(); } catch {}
-  }
+      req.on('error', retry);
+      req.setTimeout(2000, () => req.destroy(new Error('timeout')));
+    };
+    const retry = () => {
+      if (Date.now() - start >= timeoutMs) return resolve(false);
+      setTimeout(tick, READY_POLL_MS);
+    };
+    tick();
+  });
 }
 
 async function main() {
   try {
-    const result = await getTokenViaProvider();
-    console.log(JSON.stringify(result));
+    console.error(`[get_potoken] Waiting for bgutil provider at ${PING_URL} ...`);
+    const ready = await waitForServer(PING_URL, READY_TIMEOUT_MS);
+    if (!ready) throw new Error(`bgutil provider not reachable at ${PING_URL} within ${READY_TIMEOUT_MS}ms`);
+
+    console.error('[get_potoken] Provider ready. Generating token via yt-dlp ...');
+
+    const cmd = [
+      'yt-dlp',
+      '-v',
+      `--extractor-args "youtubepot-bgutilhttp:base_url=${PROVIDER_URL}"`,
+      '--dump-json',
+      '--skip-download',
+      '--no-warnings',
+      `"${TEST_VIDEO}"`,
+      '2>&1',
+    ].join(' ');
+
+    const output = execSync(cmd, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, shell: true });
+
+    const jsonStr = extractJsonObject(output);
+    if (!jsonStr) throw new Error('No JSON object found in yt-dlp output');
+
+    const info = JSON.parse(jsonStr);
+    const potoken = info.po_token || info.pot;
+    const visitorData = info.visitor_data || info.visitorData || null;
+
+    if (!potoken) throw new Error('Could not extract PO token from yt-dlp output');
+
+    process.stdout.write(JSON.stringify({ potoken, visitorData }));
+    process.stdout.write('\n');
     process.exit(0);
   } catch (err) {
-    console.error('[get_potoken] Error:', err.message);
+    console.error(`[get_potoken] Error: ${err.message}`);
     process.exit(1);
   }
 }

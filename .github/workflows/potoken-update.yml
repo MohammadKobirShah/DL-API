@@ -2,13 +2,14 @@ name: 🔄 Update PO Token
 
 on:
   schedule:
+    # Every 6 hours
     - cron: '0 */6 * * *'
   workflow_dispatch:
 
 jobs:
   update-potoken:
     name: Generate & Update PO Token
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
 
     steps:
       - name: 📥 Checkout repo
@@ -18,50 +19,113 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
-      - name: 🪟 Setup Python
+      - name: 🐳 Start bgutil PO Token provider
+        id: bgutil
+        run: |
+          docker run -d --rm \
+            --name bgutil-provider \
+            -p 4416:4416 \
+            --health-cmd "wget -qO- http://127.0.0.1:4416/ping || exit 1" \
+            --health-interval 5s \
+            --health-timeout 3s \
+            --health-retries 10 \
+            brainicism/bgutil-ytdlp-pot-provider:latest
+          CONTAINER_ID=$(docker inspect --format '{{.Id}}' bgutil-provider)
+          echo "container_id=${CONTAINER_ID}" >> "$GITHUB_OUTPUT"
+          echo "Started bgutil provider container ${CONTAINER_ID}"
+
+      - name: ⏳ Wait for provider to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            STATUS=$(docker inspect --format '{{.State.Health.Status}}' bgutil-provider 2>/dev/null || echo "starting")
+            echo "Health status: ${STATUS} (attempt ${i}/30)"
+            if [ "${STATUS}" = "healthy" ]; then
+              echo "bgutil provider is healthy"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::bgutil provider did not become healthy in 60s"
+          echo "--- container logs ---"
+          docker logs bgutil-provider || true
+          exit 1
+
+      - name: 🐍 Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 📦 Install bgutil POT Provider
-        run: npm install -g bgutil-ytdlp-pot-provider
-
-      - name: 📦 Install yt-dlp
-        run: pip install yt-dlp
+      - name: 📥 Install yt-dlp (nightly)
+        run: pip install -U --pre "yt-dlp[default]"
 
       - name: 🔑 Generate PO Token
         id: generate
+        env:
+          POT_PROVIDER_URL: http://127.0.0.1:4416
         run: |
           node scripts/get_potoken.js > potoken.json
-          Get-Content potoken.json
-        shell: pwsh
-        env:
-          NODE_ENV: production
+          echo "--- potoken.json ---"
+          cat potoken.json
+          echo "--------------------"
 
       - name: 📤 POST PO Token to Server
         if: success()
+        env:
+          API_URL: ${{ secrets.API_URL }}
         run: |
-          $tokenJson = Get-Content -Raw potoken.json
-          $parsed = $tokenJson | ConvertFrom-Json
-          $body = @{
-            potoken = $parsed.potoken
-            visitorData = $parsed.visitorData
-            expiresAt = (Get-Date).AddHours(6).ToString('o')
-          } | ConvertTo-Json
+          if [ -z "${API_URL}" ]; then
+            echo "::error::API_URL secret is not set. Add it at https://github.com/MohammadKobirShah/DL-API/settings/secrets/actions/new"
+            exit 1
+          fi
 
-          $headers = @{ "Content-Type" = "application/json" }
-          Invoke-RestMethod `
-            -Uri "${{ secrets.API_URL }}/api/admin/potoken" `
-            -Method Post `
-            -Headers $headers `
-            -Body $body
-        shell: pwsh
+          POTOKEN=$(jq -r '.potoken' potoken.json)
+          if [ -z "${POTOKEN}" ] || [ "${POTOKEN}" = "null" ]; then
+            echo "::error::potoken missing or invalid in potoken.json"
+            exit 1
+          fi
+
+          VISITOR_DATA=$(jq -r '.visitorData // empty' potoken.json)
+          EXPIRES_AT=$(date -u -d '+6 hours' '+%Y-%m-%dT%H:%M:%SZ')
+
+          BODY=$(jq -n \
+            --arg pot "${POTOKEN}" \
+            --arg vd  "${VISITOR_DATA}" \
+            --arg exp "${EXPIRES_AT}" \
+            '{potoken: $pot, expiresAt: $exp}
+             + (if $vd != "" then {visitorData: $vd} else {} end)')
+
+          echo "POST ${API_URL}/api/admin/potoken"
+          echo "Body: ${BODY}"
+
+          HTTP_CODE=$(curl -sS -o /tmp/potoken-resp.json -w "%{http_code}" \
+            -X POST \
+            -H "Content-Type: application/json" \
+            --data-binary "${BODY}" \
+            "${API_URL}/api/admin/potoken")
+
+          echo "Response (${HTTP_CODE}):"
+          cat /tmp/potoken-resp.json
+          echo
+
+          if [ "${HTTP_CODE}" != "200" ]; then
+            echo "::error::POST /api/admin/potoken returned HTTP ${HTTP_CODE}"
+            exit 1
+          fi
 
       - name: ✅ Health Check
         if: success()
+        env:
+          API_URL: ${{ secrets.API_URL }}
         run: |
-          $status = Invoke-RestMethod -Uri "${{ secrets.API_URL }}/health" -Method Get
-          Write-Host "Server status: $($status.status) ffmpeg=$($status.ffmpeg)"
-        shell: pwsh
+          echo "GET ${API_URL}/health"
+          curl -fsS "${API_URL}/health" | tee /dev/stderr
+          echo
+
+      - name: 🛑 Stop bgutil provider
+        if: always()
+        run: |
+          if docker ps -a --format '{{.Names}}' | grep -q '^bgutil-provider$'; then
+            echo "Stopping bgutil provider container..."
+            docker stop bgutil-provider || true
+          fi
